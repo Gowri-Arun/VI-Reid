@@ -1,0 +1,41 @@
+dataset: SYSU-MM01
+protocol: simple_all_search
+
+query_cameras:
+  - cam3
+  - cam6
+
+gallery_cameras:
+  - cam1
+  - cam2
+  - cam4
+  - cam5
+
+model:
+  name: warmstart_msr
+  backbone: resnet50
+  feature_dim: 512
+  pretrained_source: shared_baseline
+
+training:
+  epochs: 5
+  batch_size: 32
+  learning_rate: 0.0001
+  cmec_weight: 0.1
+  optimizer: Adam
+
+evaluation:
+  normalize_features: true
+  distance: euclidean
+  distance_computation: batched
+  metrics:
+    - rank1
+    - rank5
+    - rank10
+    - rank20
+    - mAP
+
+best_checkpoint:
+  path: checkpoints/msr_warmstart_epoch_2.pth
+  rank1: 32.08
+  map: 22.84

@@ -1,0 +1,29 @@
+python scripts/evaluate_msr_warmstart.py \
+  --data-root "/path/to/regdb-sysu-dataset/versions/1" \
+  --checkpoint checkpoints/msr_warmstart_epoch_1.pth \
+  --normalize-features \
+  --output results/msr_epoch1_result.json
+
+python scripts/evaluate_msr_warmstart.py \
+  --data-root "/path/to/regdb-sysu-dataset/versions/1" \
+  --checkpoint checkpoints/msr_warmstart_epoch_2.pth \
+  --normalize-features \
+  --output results/msr_epoch2_result.json
+
+python scripts/evaluate_msr_warmstart.py \
+  --data-root "/path/to/regdb-sysu-dataset/versions/1" \
+  --checkpoint checkpoints/msr_warmstart_epoch_3.pth \
+  --normalize-features \
+  --output results/msr_epoch3_result.json
+
+python scripts/evaluate_msr_warmstart.py \
+  --data-root "/path/to/regdb-sysu-dataset/versions/1" \
+  --checkpoint checkpoints/msr_warmstart_epoch_4.pth \
+  --normalize-features \
+  --output results/msr_epoch4_result.json
+
+python scripts/evaluate_msr_warmstart.py \
+  --data-root "/path/to/regdb-sysu-dataset/versions/1" \
+  --checkpoint checkpoints/msr_warmstart_epoch_5.pth \
+  --normalize-features \
+  --output results/msr_epoch5_result.json

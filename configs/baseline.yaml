@@ -1,0 +1,24 @@
+dataset: SYSU-MM01
+protocol: simple_all_search
+
+model:
+  name: shared_baseline
+  backbone: resnet50
+  feature_dim: 512
+
+training:
+  epochs: 5
+  batch_size: 16
+  learning_rate: 0.0003
+  optimizer: Adam
+
+evaluation:
+  normalize_features: true
+  distance: euclidean
+  distance_computation: batched
+  metrics:
+    - rank1
+    - rank5
+    - rank10
+    - rank20
+    - mAP
