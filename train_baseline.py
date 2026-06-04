@@ -1,7 +1,8 @@
 import os
-import re
+import argparse
 import random
-import itertools
+from pathlib import Path
+from typing import List, Tuple, Optional
 
 from PIL import Image
 
@@ -10,147 +11,228 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-from data.dataset_roots import get_sysu_root
 from models.baseline import BaselineReID
 
 
-def read_ids(txt_path):
-    with open(txt_path, "r") as f:
-        content = f.read()
-
-    ids = re.findall(r"\d+", content)
-    return [x.zfill(4) for x in ids]
+IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
 
 
-def collect_camera_samples(root, cam_names, train_ids, id_to_label):
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def is_image(path: Path) -> bool:
+    return path.suffix.lower() in IMG_EXTENSIONS
+
+
+def find_sysu_root(dataset_root: str) -> Path:
+    """
+    Finds SYSU-MM01 folder inside the KaggleHub dataset root.
+    """
+    root = Path(dataset_root)
+
+    if (root / "SYSU-MM01").exists():
+        return root / "SYSU-MM01"
+
+    if (root / "regdb_sysu_dataset" / "SYSU-MM01").exists():
+        return root / "regdb_sysu_dataset" / "SYSU-MM01"
+
+    for path in root.rglob("*"):
+        if path.is_dir() and path.name.lower() == "sysu-mm01":
+            return path
+
+    raise FileNotFoundError(
+        f"Could not find SYSU-MM01 folder inside {dataset_root}. "
+        f"Run os.walk() to inspect the dataset structure."
+    )
+
+
+def read_id_file(path: Path) -> Optional[set]:
+    """
+    Reads train_id.txt / val_id.txt / test_id.txt if available.
+
+    SYSU files usually contain comma-separated IDs.
+    Example:
+        0001,0002,0003,...
+    """
+    if not path.exists():
+        return None
+
+    text = path.read_text().strip()
+
+    ids = []
+    for token in text.replace("\n", ",").split(","):
+        token = token.strip()
+        if token:
+            ids.append(int(token))
+
+    return set(ids)
+
+
+def parse_pid_from_path(path: Path) -> int:
+    """
+    SYSU usually stores images as:
+        cam1/0001/xxxx.jpg
+
+    Person ID is the parent folder name.
+    """
+    try:
+        return int(path.parent.name)
+    except ValueError:
+        raise ValueError(
+            f"Could not parse person ID from path: {path}. "
+            f"Expected format like cam1/0001/image.jpg"
+        )
+
+
+def collect_sysu_images(
+    sysu_root: Path,
+    cams: List[str],
+    allowed_ids: Optional[set] = None,
+) -> List[Tuple[str, int, int]]:
     samples = []
 
-    for cam_name in cam_names:
-        cam_path = os.path.join(root, cam_name)
+    for cam_name in cams:
+        cam_dir = sysu_root / cam_name
 
-        if not os.path.isdir(cam_path):
-            print(f"Warning: missing camera folder {cam_path}")
+        if not cam_dir.exists():
+            print(f"Warning: missing camera folder {cam_dir}", flush=True)
             continue
 
-        for pid_str in train_ids:
-            person_dir = os.path.join(cam_path, pid_str)
+        camid = int(cam_name.replace("cam", ""))
 
-            if not os.path.isdir(person_dir):
+        for img_path in cam_dir.rglob("*"):
+            if not img_path.is_file() or not is_image(img_path):
                 continue
 
-            label = id_to_label[pid_str]
+            pid = parse_pid_from_path(img_path)
 
-            for img_name in os.listdir(person_dir):
-                if img_name.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
-                    img_path = os.path.join(person_dir, img_name)
-                    samples.append((img_path, label, cam_name))
+            if allowed_ids is not None and pid not in allowed_ids:
+                continue
+
+            samples.append((str(img_path), pid, camid))
 
     return samples
 
 
-class SYSUCameraDataset(Dataset):
-    def __init__(self, samples, transform=None):
+def build_label_map(samples):
+    pids = sorted(set(pid for _, pid, _ in samples))
+    return {pid: idx for idx, pid in enumerate(pids)}
+
+
+class SYSUFolderDataset(torch.utils.data.Dataset):
+    def __init__(self, samples, label_map, transform=None):
         self.samples = samples
+        self.label_map = label_map
         self.transform = transform
 
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, index):
-        img_path, label, cam_name = self.samples[index]
+    def __getitem__(self, idx):
+        img_path, pid, camid = self.samples[idx]
 
         img = Image.open(img_path).convert("RGB")
 
-        if self.transform is not None:
+        if self.transform:
             img = self.transform(img)
 
-        return img, label, cam_name
+        label = self.label_map[pid]
+        return img, label
 
 
-def train_one_epoch(model, rgb_loader, ir_loader, criterion, optimizer, device, epoch):
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
     model.train()
 
     total_loss = 0.0
     correct = 0
     total = 0
 
-    ir_iter = itertools.cycle(ir_loader)
+    for batch_idx, (images, labels) in enumerate(loader):
+        images = images.to(device, non_blocking=False)
+        labels = labels.to(device, non_blocking=False)
 
-    for batch_idx, (rgb_imgs, rgb_labels, _) in enumerate(rgb_loader):
-        ir_imgs, ir_labels, _ = next(ir_iter)
+        optimizer.zero_grad(set_to_none=True)
 
-        rgb_imgs = rgb_imgs.to(device, non_blocking=True)
-        rgb_labels = rgb_labels.to(device, non_blocking=True)
-
-        ir_imgs = ir_imgs.to(device, non_blocking=True)
-        ir_labels = ir_labels.to(device, non_blocking=True)
-
-        imgs = torch.cat([rgb_imgs, ir_imgs], dim=0)
-        labels = torch.cat([rgb_labels, ir_labels], dim=0)
-
-        _, logits = model(imgs)
-
+        logits, _ = model(images)
         loss = criterion(logits, labels)
 
-        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item()
+        total_loss += loss.item() * images.size(0)
 
         preds = logits.argmax(dim=1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
 
-        if batch_idx % 50 == 0:
-            acc = 100.0 * correct / total
+        if batch_idx % 20 == 0:
             print(
-                f"Epoch [{epoch}] Batch [{batch_idx}/{len(rgb_loader)}] "
-                f"Loss: {loss.item():.4f} Acc: {acc:.2f}%"
+                f"Epoch {epoch} | Batch {batch_idx}/{len(loader)} | "
+                f"Loss: {loss.item():.4f}",
+                flush=True,
             )
 
-    avg_loss = total_loss / len(rgb_loader)
-    avg_acc = 100.0 * correct / total
-
-    return avg_loss, avg_acc
+    return total_loss / total, correct / total
 
 
 def main():
-    root = get_sysu_root()
-    print("Dataset path:", root)
+    parser = argparse.ArgumentParser()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
+    parser.add_argument("--data-root", type=str, required=True)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--feature-dim", type=int, default=512)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--seed", type=int, default=42)
 
-    train_id_path = os.path.join(root, "exp", "train_id.txt")
-    train_ids = read_ids(train_id_path)
+    # For quick sanity/debug runs. Use 0 for full dataset.
+    parser.add_argument("--max-samples", type=int, default=0)
 
-    id_to_label = {
-        pid_str: idx for idx, pid_str in enumerate(sorted(train_ids))
-    }
+    args = parser.parse_args()
 
-    num_classes = len(id_to_label)
+    set_seed(args.seed)
 
-    visible_cams = ["cam1", "cam2", "cam4", "cam5"]
-    infrared_cams = ["cam3", "cam6"]
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    os.makedirs("results", exist_ok=True)
 
-    rgb_samples = collect_camera_samples(
-        root=root,
-        cam_names=visible_cams,
-        train_ids=train_ids,
-        id_to_label=id_to_label,
-    )
+    sysu_root = find_sysu_root(args.data_root)
+    print(f"Using SYSU root: {sysu_root}", flush=True)
 
-    ir_samples = collect_camera_samples(
-        root=root,
-        cam_names=infrared_cams,
-        train_ids=train_ids,
-        id_to_label=id_to_label,
-    )
+    exp_dir = sysu_root / "exp"
+    train_ids = read_id_file(exp_dir / "train_id.txt")
+    val_ids = read_id_file(exp_dir / "val_id.txt")
 
-    print("RGB samples:", len(rgb_samples))
-    print("IR samples:", len(ir_samples))
-    print("Number of classes:", num_classes)
+    if train_ids is not None:
+        allowed_ids = set(train_ids)
+        if val_ids is not None:
+            allowed_ids |= set(val_ids)
+        print(f"Using official train/val IDs: {len(allowed_ids)} IDs", flush=True)
+    else:
+        allowed_ids = None
+        print("Warning: exp/train_id.txt not found. Using all IDs for training.", flush=True)
+
+    cams = ["cam1", "cam2", "cam3", "cam4", "cam5", "cam6"]
+    samples = collect_sysu_images(sysu_root, cams=cams, allowed_ids=allowed_ids)
+
+    if len(samples) == 0:
+        raise RuntimeError("No training images found. Check dataset structure.")
+
+    random.shuffle(samples)
+
+    if args.max_samples and args.max_samples > 0:
+        samples = samples[:args.max_samples]
+        print(f"DEBUG MODE: using only {len(samples)} samples", flush=True)
+
+    label_map = build_label_map(samples)
+    num_classes = len(label_map)
+
+    print(f"Total training images: {len(samples)}", flush=True)
+    print(f"Number of training identities/classes: {num_classes}", flush=True)
 
     transform = transforms.Compose([
         transforms.Resize((256, 128)),
@@ -162,62 +244,74 @@ def main():
         ),
     ])
 
-    rgb_dataset = SYSUCameraDataset(rgb_samples, transform=transform)
-    ir_dataset = SYSUCameraDataset(ir_samples, transform=transform)
+    dataset = SYSUFolderDataset(
+        samples=samples,
+        label_map=label_map,
+        transform=transform,
+    )
 
-    rgb_loader = DataLoader(
-        rgb_dataset,
-        batch_size=32,
+    # Safer Colab settings:
+    # num_workers=0 and pin_memory=False avoid many runtime/multiprocessing issues.
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
-        pin_memory=True,
+        num_workers=0,
+        pin_memory=False,
         drop_last=True,
     )
 
-    ir_loader = DataLoader(
-        ir_dataset,
-        batch_size=32,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True,
-        drop_last=True,
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device, flush=True)
+
+    if device.type == "cuda":
+        print("GPU:", torch.cuda.get_device_name(0), flush=True)
 
     model = BaselineReID(
         num_classes=num_classes,
+        feature_dim=args.feature_dim,
         pretrained=True,
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=3e-4,
-        weight_decay=5e-4,
-    )
+    best_loss = float("inf")
 
-    num_epochs = 5
-
-    os.makedirs("checkpoints", exist_ok=True)
-
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(1, args.epochs + 1):
         loss, acc = train_one_epoch(
             model=model,
-            rgb_loader=rgb_loader,
-            ir_loader=ir_loader,
+            loader=loader,
             criterion=criterion,
             optimizer=optimizer,
             device=device,
             epoch=epoch,
         )
 
-        print(f"Epoch {epoch} finished | Loss: {loss:.4f} | Acc: {acc:.2f}%")
+        print(f"Epoch {epoch} complete | Loss: {loss:.4f} | Acc: {acc:.4f}", flush=True)
 
-        save_path = f"checkpoints/baseline_epoch_{epoch}.pth"
-        torch.save(model.state_dict(), save_path)
-        print(f"Saved checkpoint: {save_path}")
+        ckpt = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "num_classes": num_classes,
+            "feature_dim": args.feature_dim,
+            "label_map": label_map,
+            "sysu_root": str(sysu_root),
+            "args": vars(args),
+        }
 
-    print("Baseline training finished.")
+        epoch_path = os.path.join(args.checkpoint_dir, f"baseline_epoch_{epoch}.pth")
+        torch.save(ckpt, epoch_path)
+        print(f"Saved checkpoint: {epoch_path}", flush=True)
+
+        if loss < best_loss:
+            best_loss = loss
+            best_path = os.path.join(args.checkpoint_dir, "baseline_best.pth")
+            torch.save(ckpt, best_path)
+            print(f"Saved best checkpoint: {best_path}", flush=True)
+
+    print("Baseline training complete.", flush=True)
 
 
 if __name__ == "__main__":
