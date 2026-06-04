@@ -1,0 +1,8 @@
+python scripts/train_msr_warmstart.py \
+  --data-root "/path/to/regdb-sysu-dataset/versions/1" \
+  --baseline-checkpoint checkpoints/baseline_best.pth \
+  --epochs 5 \
+  --batch-size 32 \
+  --lr 0.0001 \
+  --cmec-weight 0.1 \
+  --checkpoint-dir checkpoints

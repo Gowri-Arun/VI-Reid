@@ -1,0 +1,6 @@
+python scripts/train_baseline.py \
+  --data-root "/path/to/regdb-sysu-dataset/versions/1" \
+  --epochs 5 \
+  --batch-size 16 \
+  --lr 0.0003 \
+  --checkpoint-dir checkpoints
