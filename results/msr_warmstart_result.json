@@ -1,0 +1,13 @@
+{
+  "model": "warmstart_msr",
+  "protocol": "SYSU simple all-search: IR query cam3/cam6, RGB gallery cam1/cam2/cam4/cam5",
+  "checkpoint": "checkpoints/msr_warmstart_best.pth",
+  "normalize_features": true,
+  "rank1": 30.817775440441757,
+  "rank5": 46.542203523534056,
+  "rank10": 54.37812253484091,
+  "rank20": 62.84512227189061,
+  "map": 22.026684718466083,
+  "num_query": 3803,
+  "num_gallery": 6775
+}

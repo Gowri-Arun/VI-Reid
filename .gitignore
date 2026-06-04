@@ -6,3 +6,15 @@ __pycache__/
 wandb/
 runs/
 *.zip
+
+# Model checkpoints
+checkpoints/
+*.pth
+*.pt
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Colab/Kaggle
+.ipynb_checkpoints/

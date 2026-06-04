@@ -1,56 +1,149 @@
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import models
 
 
-class MSRModel(nn.Module):
-    def __init__(self, num_classes, num_views=6, pretrained=True):
+class MSRReID(nn.Module):
+    """
+    Warm-startable MSR-style two-branch model.
+
+    Branches:
+    - RGB branch for visible images
+    - IR branch for infrared images
+
+    Each branch has:
+    - ResNet-50 backbone
+    - embedding layer
+
+    Shared part:
+    - shared_fc maps modality-specific embedding into shared space
+    - shared_classifier predicts identity from shared feature
+
+    Classifiers:
+    - rgb_classifier for RGB branch identity loss
+    - ir_classifier for IR branch identity loss
+    - shared_classifier for modality-shared identity loss
+    """
+
+    def __init__(self, num_classes: int, feature_dim: int = 512, pretrained: bool = True):
         super().__init__()
 
-        if pretrained:
-            weights = models.ResNet50_Weights.IMAGENET1K_V1
-        else:
-            weights = None
+        weights = models.ResNet50_Weights.DEFAULT if pretrained else None
 
-        visible_resnet = models.resnet50(weights=weights)
-        infrared_resnet = models.resnet50(weights=weights)
+        rgb_resnet = models.resnet50(weights=weights)
+        ir_resnet = models.resnet50(weights=weights)
 
-        self.visible_backbone = nn.Sequential(*list(visible_resnet.children())[:-1])
-        self.infrared_backbone = nn.Sequential(*list(infrared_resnet.children())[:-1])
+        self.rgb_backbone = nn.Sequential(*list(rgb_resnet.children())[:-1])
+        self.ir_backbone = nn.Sequential(*list(ir_resnet.children())[:-1])
 
-        feature_dim = 2048
+        self.rgb_embedding = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(2048, feature_dim),
+            nn.BatchNorm1d(feature_dim),
+            nn.ReLU(inplace=True),
+        )
 
-        self.visible_classifier = nn.Linear(feature_dim, num_classes)
-        self.infrared_classifier = nn.Linear(feature_dim, num_classes)
+        self.ir_embedding = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(2048, feature_dim),
+            nn.BatchNorm1d(feature_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        self.shared_fc = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.BatchNorm1d(feature_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        self.rgb_classifier = nn.Linear(feature_dim, num_classes)
+        self.ir_classifier = nn.Linear(feature_dim, num_classes)
         self.shared_classifier = nn.Linear(feature_dim, num_classes)
-        self.view_classifier = nn.Linear(feature_dim, num_views)
 
-    def extract_visible(self, x):
-        feat = self.visible_backbone(x)
-        feat = feat.view(feat.size(0), -1)
-        return feat
+    def forward_rgb(self, x):
+        x = self.rgb_backbone(x)
+        specific_feat = self.rgb_embedding(x)
+        shared_feat = self.shared_fc(specific_feat)
 
-    def extract_infrared(self, x):
-        feat = self.infrared_backbone(x)
-        feat = feat.view(feat.size(0), -1)
-        return feat
+        rgb_logits = self.rgb_classifier(specific_feat)
+        shared_logits = self.shared_classifier(shared_feat)
 
-    def forward(self, rgb_imgs, ir_imgs):
-        rgb_feat = self.extract_visible(rgb_imgs)
-        ir_feat = self.extract_infrared(ir_imgs)
+        return rgb_logits, shared_logits, specific_feat, shared_feat
 
-        outputs = {
-            "rgb_feat": rgb_feat,
-            "ir_feat": ir_feat,
+    def forward_ir(self, x):
+        x = self.ir_backbone(x)
+        specific_feat = self.ir_embedding(x)
+        shared_feat = self.shared_fc(specific_feat)
 
-            "rgb_logits": self.visible_classifier(rgb_feat),
-            "ir_logits": self.infrared_classifier(ir_feat),
+        ir_logits = self.ir_classifier(specific_feat)
+        shared_logits = self.shared_classifier(shared_feat)
 
-            "rgb_shared_logits": self.shared_classifier(rgb_feat),
-            "ir_shared_logits": self.shared_classifier(ir_feat),
+        return ir_logits, shared_logits, specific_feat, shared_feat
 
-            "rgb_view_logits": self.view_classifier(rgb_feat),
-            "ir_view_logits": self.view_classifier(ir_feat),
-        }
+    def forward(self, x, modality):
+        """
+        modality:
+            "rgb" or "ir"
+        """
+        if modality == "rgb":
+            return self.forward_rgb(x)
+        elif modality == "ir":
+            return self.forward_ir(x)
+        else:
+            raise ValueError(f"Unknown modality: {modality}")
 
-        return outputs
+    @torch.no_grad()
+    def extract_features(self, x, modality: str, normalize: bool = True):
+        if modality == "rgb":
+            _, _, _, shared_feat = self.forward_rgb(x)
+        elif modality == "ir":
+            _, _, _, shared_feat = self.forward_ir(x)
+        else:
+            raise ValueError(f"Unknown modality: {modality}")
+
+        if normalize:
+            shared_feat = F.normalize(shared_feat, p=2, dim=1)
+
+        return shared_feat
+
+
+def load_baseline_into_msr(msr_model, baseline_checkpoint_path, device="cpu"):
+    """
+    Warm-start MSR from shared baseline checkpoint.
+
+    Copies:
+    baseline.backbone  -> rgb_backbone + ir_backbone
+    baseline.embedding -> rgb_embedding + ir_embedding
+    baseline.classifier -> rgb_classifier + ir_classifier + shared_classifier
+    """
+
+    ckpt = torch.load(baseline_checkpoint_path, map_location=device)
+    baseline_state = ckpt["model_state_dict"]
+
+    def copy_module(prefix_from, module_to, module_name):
+        new_state = {}
+
+        for key, value in baseline_state.items():
+            if key.startswith(prefix_from + "."):
+                new_key = key.replace(prefix_from + ".", "")
+                new_state[new_key] = value
+
+        missing, unexpected = module_to.load_state_dict(new_state, strict=False)
+
+        print(f"Loaded {prefix_from} -> {module_name}")
+        print(f"  Missing keys: {len(missing)}")
+        print(f"  Unexpected keys: {len(unexpected)}")
+
+    copy_module("backbone", msr_model.rgb_backbone, "rgb_backbone")
+    copy_module("backbone", msr_model.ir_backbone, "ir_backbone")
+
+    copy_module("embedding", msr_model.rgb_embedding, "rgb_embedding")
+    copy_module("embedding", msr_model.ir_embedding, "ir_embedding")
+
+    copy_module("classifier", msr_model.rgb_classifier, "rgb_classifier")
+    copy_module("classifier", msr_model.ir_classifier, "ir_classifier")
+    copy_module("classifier", msr_model.shared_classifier, "shared_classifier")
+
+    return msr_model, ckpt
